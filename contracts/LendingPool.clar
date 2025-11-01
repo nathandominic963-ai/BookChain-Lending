@@ -1,0 +1,190 @@
+(define-constant ERR-INVALID-AMOUNT (err u200))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u201))
+(define-constant ERR-NOT-ADMIN (err u202))
+(define-constant ERR-POOL-PAUSED (err u203))
+(define-constant ERR-INVALID-DURATION (err u204))
+(define-constant ERR-WITHDRAWAL-LOCKED (err u205))
+(define-constant ERR-ZERO-CONTRIBUTION (err u206))
+(define-constant ERR-MAX-CONTRIB-EXCEEDED (err u207))
+(define-constant ERR-INVALID-INTEREST-RATE (err u208))
+(define-constant ERR-UNLOCK-PERIOD-NOT-ENDED (err u209))
+
+(define-data-var admin principal tx-sender)
+(define-data-var pool-paused bool false)
+(define-data-var total-pool-balance uint u0)
+(define-data-var min-contribution uint u1000)
+(define-data-var max-contribution uint u100000)
+(define-data-var withdrawal-lock-period uint u144) ;; Approx 1 day in blocks
+(define-data-var base-interest-rate uint u2) ;; 2% base
+(define-data-var unlock-timestamp uint u0)
+
+(define-map contributions {user: principal} {amount: uint, last-contrib: uint, locked-until: uint})
+(define-map historical-yields {timestamp: uint} uint)
+
+(define-read-only (get-admin)
+  (var-get admin)
+)
+
+(define-read-only (is-paused)
+  (var-get pool-paused)
+)
+
+(define-read-only (get-total-pool-balance)
+  (var-get total-pool-balance)
+)
+
+(define-read-only (get-min-contribution)
+  (var-get min-contribution)
+)
+
+(define-read-only (get-max-contribution)
+  (var-get max-contribution)
+)
+
+(define-read-only (get-base-interest-rate)
+  (var-get base-interest-rate)
+)
+
+(define-read-only (get-user-contribution (user principal))
+  (get amount (map-get? contributions {user: user}))
+)
+
+(define-read-only (get-user-locked-until (user principal))
+  (get locked-until (map-get? contributions {user: user}))
+)
+
+(define-read-only (is-withdrawal-locked (user principal))
+  (let ((locked (get locked-until (default-to {amount: u0, last-contrib: u0, locked-until: u0} (map-get? contributions {user: user})))))
+    (>= (var-get unlock-timestamp) locked)
+  )
+)
+
+(define-public (set-admin (new-admin principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
+    (var-set admin new-admin)
+    (ok true)
+  )
+)
+
+(define-public (pause-pool)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
+    (var-set pool-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-pool)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
+    (var-set pool-paused false)
+    (ok true)
+  )
+)
+
+(define-public (set-min-contribution (new-min uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
+    (asserts! (> new-min u0) ERR-INVALID-AMOUNT)
+    (var-set min-contribution new-min)
+    (ok true)
+  )
+)
+
+(define-public (set-max-contribution (new-max uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
+    (asserts! (> new-max u0) ERR-INVALID-AMOUNT)
+    (var-set max-contribution new-max)
+    (ok true)
+  )
+)
+
+(define-public (set-base-interest-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
+    (asserts! (and (<= new-rate u10) (>= new-rate u1)) ERR-INVALID-INTEREST-RATE)
+    (var-set base-interest-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-public (set-withdrawal-lock-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
+    (asserts! (> new-period u0) ERR-INVALID-DURATION)
+    (var-set withdrawal-lock-period new-period)
+    (ok true)
+  )
+)
+
+(define-public (contribute-to-pool (amount uint))
+  (let ((sender tx-sender))
+    (asserts! (not (var-get pool-paused)) ERR-POOL-PAUSED)
+    (asserts! (>= amount (var-get min-contribution)) ERR-INVALID-AMOUNT)
+    (asserts! (<= amount (var-get max-contribution)) ERR-MAX-CONTRIB-EXCEEDED)
+    (asserts! (> amount u0) ERR-ZERO-CONTRIBUTION)
+    (try! (contract-call? .stx-token transfer amount tx-sender (as-contract tx-sender) none))
+    (let ((current (default-to {amount: u0, last-contrib: u0, locked-until: u0} (map-get? contributions {user: sender})))
+          (new-amount (+ (get amount current) amount))
+          (new-locked (+ block-height (var-get withdrawal-lock-period))))
+      (map-set contributions {user: sender} {amount: new-amount, last-contrib: block-height, locked-until: new-locked})
+      (var-set total-pool-balance (+ (var-get total-pool-balance) amount))
+      (ok new-amount)
+    )
+  )
+)
+
+(define-public (withdraw-from-pool (amount uint))
+  (let ((sender tx-sender)
+        (current (unwrap! (map-get? contributions {user: sender}) ERR-INSUFFICIENT-BALANCE))
+        (user-balance (get amount current))
+        (locked-until (get locked-until current)))
+    (asserts! (not (var-get pool-paused)) ERR-POOL-PAUSED)
+    (asserts! (>= user-balance amount) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (>= block-height locked-until) ERR-WITHDRAWAL-LOCKED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (try! (as-contract (contract-call? .stx-token transfer amount (as-contract tx-sender) sender none)))
+    (let ((new-balance (- user-balance amount)))
+      (if (> new-balance u0)
+          (map-set contributions {user: sender} {amount: new-balance, last-contrib: (get last-contrib current), locked-until: locked-until})
+          (map-delete contributions {user: sender})
+      )
+      (var-set total-pool-balance (- (var-get total-pool-balance) amount))
+      (ok new-balance)
+    )
+  )
+)
+
+(define-read-only (calculate-interest (principal uint) (duration-blocks uint))
+  (let ((rate (var-get base-interest-rate))
+        (days (/ duration-blocks u144))) ;; Approx blocks per day
+    (* principal (/ (* rate days) u100))
+  )
+)
+
+(define-public (record-yield (yield-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
+    (map-set historical-yields {timestamp: block-height} yield-amount)
+    (ok true)
+  )
+)
+
+(define-read-only (get-historical-yield (timestamp uint))
+  (map-get? historical-yields {timestamp: timestamp})
+)
+
+(define-public (update-unlock-timestamp (new-timestamp uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-ADMIN)
+    (asserts! (>= new-timestamp (var-get unlock-timestamp)) ERR-INVALID-TIMESTAMP)
+    (var-set unlock-timestamp new-timestamp)
+    (ok true)
+  )
+)
+
+(define-read-only (get-unlock-timestamp)
+  (var-get unlock-timestamp)
+)
